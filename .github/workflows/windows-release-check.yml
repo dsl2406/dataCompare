@@ -1,0 +1,98 @@
+name: Windows release verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the published release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: v0.1.0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24.22.3'
+          package-manager-cache: false
+
+      - name: Install dependencies and rebuild reference web assets
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build:server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+          npm install --prefix "$env:RUNNER_TEMP/browser-tools" --no-package-lock playwright@1.62.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download and verify the published Windows ZIP
+        run: |
+          $base = 'https://github.com/${{ github.repository }}/releases/download/v0.1.0'
+          $filename = 'data-migration-validation-local-windows-x64-v0.1.0.zip'
+          $zip = Join-Path $pwd "releases/$filename"
+          Invoke-WebRequest "$base/$filename" -OutFile $zip
+          Invoke-WebRequest "$base/SHA256SUMS.txt" -OutFile releases/SHA256SUMS.txt
+          $line = Get-Content releases/SHA256SUMS.txt | Where-Object { $_.EndsWith($filename) }
+          if (-not $line) { throw 'Windows ZIP checksum entry is missing' }
+          $expected = ($line -split '\s+')[0]
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Windows ZIP checksum mismatch' }
+          Expand-Archive $zip -DestinationPath releases/local-windows-x64
+          Write-Host "Verified published ZIP SHA-256: $actual"
+
+      - name: Verify native Windows execution and release contents
+        run: |
+          $env:RELEASE_LAUNCHER = (Resolve-Path releases/local-windows-x64/DataMigrationValidation.exe).Path
+          npm run test:release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run browser tests against the published EXE
+        run: |
+          $env:PLAYWRIGHT_MODULE = Join-Path $env:RUNNER_TEMP 'browser-tools/node_modules/playwright'
+          @'
+          import { spawn } from 'node:child_process';
+          import { resolve } from 'node:path';
+          import { tmpdir } from 'node:os';
+
+          const executable = resolve('releases/local-windows-x64/DataMigrationValidation.exe');
+          const server = spawn(executable, ['-no-browser'], { cwd: tmpdir(), stdio: ['ignore', 'pipe', 'pipe'] });
+          try {
+            const address = await new Promise((resolve, reject) => {
+              let output = '';
+              const timer = setTimeout(() => reject(new Error('Windows EXE startup timed out')), 20000);
+              server.once('error', error => { clearTimeout(timer); reject(error); });
+              server.once('exit', code => { clearTimeout(timer); reject(new Error(`Windows EXE exited: ${code}`)); });
+              server.stderr.on('data', bytes => process.stderr.write(bytes));
+              server.stdout.on('data', bytes => {
+                process.stdout.write(bytes);
+                output += bytes;
+                const match = output.match(/URL: (http:\/\/127\.0\.0\.1:\d+\/)/);
+                if (match) { clearTimeout(timer); resolve(match[1]); }
+              });
+            });
+            for (const file of ['browser-check.mjs', 'batch-check.mjs', 'template-check.mjs']) {
+              console.log(`Running ${file} against the published Windows EXE`);
+              await new Promise((resolve, reject) => {
+                const child = spawn(process.execPath, [`tests/${file}`], {
+                  env: { ...process.env, TEST_URL: address }, stdio: 'inherit',
+                });
+                child.once('error', reject);
+                child.once('exit', code => code === 0 ? resolve() : reject(new Error(`${file} exited: ${code}`)));
+              });
+            }
+          } finally {
+            server.kill();
+          }
+          '@ | node --input-type=module
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
